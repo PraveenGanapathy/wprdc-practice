@@ -237,12 +237,168 @@ Conclusion: the recent years almost disappeared while older years were unchanged
 
 ## What changes at 100× scale / with daily refreshes
 
-- **Full download every day stops making sense.** 50 million rows is about 11 GB per day. Fetch only what changed (CKAN `datastore_search` with a filter on a date or `_id`), or check `last_modified` first and skip the run if nothing changed.
-- **TRUNCATE + COPY of the whole table gets slow** and holds a lock for the whole load. Load into a new table and swap it in, or partition by year and replace only changed partitions.
-- **dbt full rebuilds get slow.** Make `stg_sales` incremental, and only rebuild mart years that changed.
-- **The 10% row-drop rule is too blunt.** Compare per year (as in the investigation above), so a loss in recent years is caught even if the total barely moves.
-- **One file on disk is not enough history.** Keep dated or hashed raw files in object storage (S3 / GCS) to replay or compare days.
-- **Airflow `standalone` is for local use only.** Use a real scheduler + workers + a Postgres metadata DB, or a managed Airflow.
+1. Downloading the whole file every day
+- Currently, 110 MB in about 10 seconds. That's fine. At 100×, It will be 11 GB every day, even if only 1,000 rows changed. Most of it is the same data as yesterday. Best solution is Incremental loading. Ask the API only for new or changed rows, for example "rows recorded since yesterday" or check last_modified first, and skip the run if nothing changed.
+
+2. TRUNCATE + COPY of the whole table
+- At Present, reloading 506k rows takes seconds. At 100×, reloading 50M rows takes many minutes, and the table is locked that whole time, so queries wait. Fix is Load into a new table, then swap names, so readers never wait or partition by year and replace only the year that changed.
+
+3. dbt rebuilds every table from scratch
+- Now, stg_sales is rebuilt completely each day, which is quick. At 100×, rebuilding 50M rows daily is slow and costly. An incremental model in dbt (materialized='incremental') processes only new rows and adds them to the existing table.
+
+4. The 10% row-drop check is too rough
+- On 2026-10-27: year 2025 lost 98% of its rows when compared to previous day. With 100× more history, losing all of 2025 could be less than 10% of the total, so the check would miss it. so, we need to check per year, which is exactly what I did by manual way during the investigation.
+
+5. Only one raw file on disk
+- data/raw/sales.csv is overwritten every run, even by the bad file. This happend currently. At 100× and daily, you can't go back to "what did the source send last Tuesday?" we need to keep dated files in cloud storage (S3, or Azure Blob / ADLS, the same idea as your ADF landing zone), and delete them after 30 days.
+
+6. Airflow standalone
+- It's one container running everything, with a tiny built-in database. Fine for a laptop. For Prod a separate scheduler and workers, with a proper Postgres database for Airflow, or a managed service such as AWS MWAA or Google Cloud Composer.
 
 ---
-- **Thanks Claude Code for documneting the changes
+
+## Attaching the Manual logic evaluations:
+
+```sql
+
+SELECT * FROM raw.load_log ORDER BY loaded_at;
+
+SELECT * FROM raw.sales LIMIT 20;
+
+SELECT * FROM raw.sales               WHERE deedbook = '18292' AND deedpage = '134' LIMIT 5;  -- 173 rows, $185,000 each
+SELECT * FROM analytics.stg_sales     WHERE deed_book = '18292' AND deed_page = '134' LIMIT 5; -- cleaned
+SELECT * FROM analytics.fct_transactions WHERE transaction_id LIKE 'D:18292-134:%';          -- 1 row: one sale of $185,000
+
+
+
+SELECT * FROM analytics.mart_muni_year_prices
+WHERE muni_name = 'Penn Hills' ORDER BY sale_year;
+
+
+SELECT version();
+
+
+SELECT count(*) FROM raw.sales;
+
+
+SELECT 
+    saledesc, 
+    COUNT(*) AS n,
+    COUNT(*) * 100.0 / 506425 AS percentage_or_ratio
+FROM raw.sales 
+GROUP BY saledesc 
+ORDER BY n DESC;
+
+
+
+SELECT price, count(*) AS n
+FROM raw.sales
+GROUP BY price
+ORDER BY n DESC
+LIMIT 15;
+
+
+
+Query 3: are municipality names clean?
+SELECT munidesc, length(munidesc) AS len, count(*) AS n
+FROM raw.sales
+WHERE munidesc LIKE '%Penn Hills%'
+GROUP BY munidesc;
+
+
+
+SELECT deedbook, deedpage, count(*) AS parcels, min(price) AS min_p, max(price) AS max_p
+FROM raw.sales
+GROUP BY deedbook, deedpage
+HAVING count(*) > 1
+ORDER BY parcels DESC
+LIMIT 10;
+
+
+SELECT deedbook, deedpage, count(*) AS parcels, min(price) AS min_p, max(price) AS max_p
+FROM raw.sales
+WHERE deedbook IS NOT NULL AND deedbook NOT IN ('0', '00', '')
+GROUP BY deedbook, deedpage
+HAVING count(*) > 1
+ORDER BY parcels DESC
+LIMIT 10;
+
+
+
+SELECT parid, full_address, saledate, price, saledesc
+FROM raw.sales
+WHERE deedbook = '134' AND deedpage = '173';
+
+
+
+SELECT deedbook, deedpage,
+       count(*)                          AS parcels,
+       count(DISTINCT price)             AS different_prices,
+       max(price)                        AS price,
+       string_agg(DISTINCT saledesc, ', ') AS descriptions
+
+FROM raw.sales
+WHERE length(deedbook) >= 4
+GROUP BY deedbook, deedpage
+HAVING count(*) >= 5
+ORDER BY parcels DESC
+LIMIT 5;
+
+SELECT * FROM analytics.stg_sales LIMIT 10;
+
+SELECT count(*) FROM analytics.stg_sales;
+
+
+SELECT * FROM analytics.mart_muni_year_prices
+WHERE municipality = 'Penn Hills'
+ORDER BY sale_year;
+
+
+SELECT * FROM analytics.mart_muni_year_prices
+where sales >= 30
+ORDER BY sales 
+
+LIMIT 10
+
+SELECT 
+    *,
+    median_price-LAG(median_price, 1) OVER (ORDER BY sale_year) AS diff_median_price
+FROM analytics.mart_muni_year_prices
+WHERE sale_year in ('2019' , '2025')
+  and  sales >= 30
+ORDER BY sale_year;
+
+SELECT parid, sale_date, price, saledesc
+FROM analytics.stg_sales
+WHERE municipality = '12th Ward - PITTSBURGH'
+  AND extract(year FROM sale_date) = 2012
+  AND saledesc = 'VALID SALE';
+
+SELECT 
+    y25.municipality,
+    y19.median_price AS median_price_2019,
+    y25.median_price AS median_price_2025,
+    y19.sales AS sales_2019,
+    y25.sales AS sales_2025,
+    (y25.median_price - y19.median_price) AS diff_median_price,
+    ROUND(100.0 * ((y25.median_price - y19.median_price) / y19.median_price)::numeric, 2) AS pct_growth
+FROM analytics.mart_muni_year_prices y19
+INNER JOIN analytics.mart_muni_year_prices y25
+    ON y19.municipality = y25.municipality
+WHERE y19.sale_year = '2019'
+  AND y25.sale_year = '2025'
+  AND y19.sales >= 30
+  AND y25.sales >= 30
+ORDER BY diff_median_price DESC; -- pct_growth 
+
+
+SELECT left(saledate, 4) AS yr, count(*) FROM raw.sales GROUP BY 1 ORDER BY 1;
+
+
+
+```
+
+
+
+---
+- **Thanks Claude Code for documneting the changes**
