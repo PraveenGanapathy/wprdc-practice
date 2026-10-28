@@ -1,0 +1,9 @@
+name: wprdc
+version: "1.0"
+profile: wprdc
+
+model-paths: ["models"]
+
+models:
+  wprdc:
+    +materialized: table

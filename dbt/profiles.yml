@@ -1,0 +1,12 @@
+wprdc:
+  target: dev
+  outputs:
+    dev:
+      type: postgres
+      host: "{{ env_var('DB_HOST', 'localhost') }}"
+      port: "{{ env_var('DB_PORT', '5433') | int }}"
+      dbname: warehouse
+      user: praveen
+      password: "{{ env_var('DB_PASSWORD') }}"
+      schema: analytics
+      threads: 4

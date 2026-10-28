@@ -1,0 +1,10 @@
+version: 2
+models:
+  - name: mart_muni_year_prices
+    columns:
+      - name: municipality
+        tests: [not_null]
+      - name: sale_year
+        tests: [not_null]
+      - name: median_price
+        tests: [not_null]
